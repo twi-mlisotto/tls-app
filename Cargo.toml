@@ -1,0 +1,7 @@
+[workspace]
+members = ["program", "script", "shared"]
+resolver = "2"
+
+[patch.crates-io]
+# Uncomment if you hit issues with sp1-zkvm dependencies:
+# sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", branch = "patch-v0.10.8" }

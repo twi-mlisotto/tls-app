@@ -1,0 +1,21 @@
+[package]
+name = "sp1-https-json-program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = "6.0.0"
+sp1-https-json-shared = { path = "../shared" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+x509-cert = { version = "0.2", default-features = false }
+der = { version = "0.7", default-features = false, features = ["alloc", "oid"] }
+webpki-roots = "0.26"
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
