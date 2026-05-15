@@ -60,9 +60,8 @@ cd ..
 Runs the full verification pipeline inside the SP1 zkVM executor without generating a proof. Good for development and checking correctness.
 
 ```bash
-SP1_SKIP_PROGRAM_BUILD=1 cargo run --release \
-  --manifest-path script/Cargo.toml \
-  --bin sp1-https-json-script -- \
+cd script/
+cargo run --release -- \
   --url "https://blockchain.info/ticker" \
   --field "/USD/last" \
   --threshold 1000
@@ -82,9 +81,8 @@ cycles:    21202056
 Uses SP1's mock prover — cryptographically unsound but structurally identical to a real proof. Useful for testing the full prove → verify flow locally.
 
 ```bash
-SP1_PROVER=mock SP1_SKIP_PROGRAM_BUILD=1 cargo run --release \
-  --manifest-path script/Cargo.toml \
-  --bin sp1-https-json-script -- \
+cd script/
+SP1_PROVER=mock cargo run --release -- \
   --url "https://blockchain.info/ticker" \
   --field "/USD/last" \
   --threshold 1000 \

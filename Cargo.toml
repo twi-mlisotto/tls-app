@@ -10,4 +10,6 @@ sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-
 curve25519-dalek = { git = "https://github.com/sp1-patches/curve25519-dalek", tag = "patch-4.1.3-sp1-6.2.0" }
 p256 = { git = "https://github.com/sp1-patches/elliptic-curves", package = "p256", tag = "patch-p256-13.2-sp1-6.2.0" }
 crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", tag = "patch-0.5.5-sp1-6.2.0" }
-rsa = { git = "https://github.com/sp1-patches/RustCrypto-RSA", tag = "patch-0.9.6-sp1-6.2.0" }
+#rsa = { git = "https://github.com/sp1-patches/RustCrypto-RSA", tag = "patch-0.9.6-sp1-6.2.0" }
+## Fix PR: https://github.com/sp1-patches/RustCrypto-RSA/pull/39
+rsa = { git = "https://github.com/sergey-melnychuk/RustCrypto-RSA", branch = "fix/no-std-zkvm-core-mem" }
