@@ -374,7 +374,11 @@ fn find_trust_anchor(
     chain_ders: &[Vec<u8>],
 ) -> (usize, x509_cert::spki::SubjectPublicKeyInfoOwned) {
     // Strategy A: look for a cert whose subject bytes match a trust anchor.
-    for i in 0..chain.len() {
+    // Start at i = 1: a leaf cert (chain[0]) can never *be* a trust anchor —
+    // matching it would return anchor_boundary = 0, which skips all chain
+    // signature verification and lets the caller substitute a self-issued cert
+    // whose private key they control as the leaf for CertificateVerify.
+    for i in 1..chain.len() {
         if let Some(subj_content) = raw_name_content(chain_ders, i, NameField::Subject) {
             if let Some(anchor) = webpki_roots::TLS_SERVER_ROOTS
                 .iter()
