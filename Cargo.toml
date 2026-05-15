@@ -2,6 +2,12 @@
 members = ["program", "script", "shared"]
 resolver = "2"
 
+# SP1 precompile patches — accelerate crypto in the zkVM guest.
+# On non-zkvm targets (the host `script` build) these fall back to the
+# upstream implementation, so patching at the workspace root is safe.
 [patch.crates-io]
-# Uncomment if you hit issues with sp1-zkvm dependencies:
-# sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", branch = "patch-v0.10.8" }
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-6.2.0" }
+curve25519-dalek = { git = "https://github.com/sp1-patches/curve25519-dalek", tag = "patch-4.1.3-sp1-6.2.0" }
+p256 = { git = "https://github.com/sp1-patches/elliptic-curves", package = "p256", tag = "patch-p256-13.2-sp1-6.2.0" }
+crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", tag = "patch-0.5.5-sp1-6.2.0" }
+rsa = { git = "https://github.com/sp1-patches/RustCrypto-RSA", tag = "patch-0.9.6-sp1-6.2.0" }
